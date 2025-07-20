@@ -416,3 +416,342 @@ class vLLMAsyncRollout:
             return self.wake_up(*args, **kwargs)
         else:
             return self.inference_engine.execute_method(method, *args, **kwargs)
+
+import re
+import json
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from verl.utils.torch_functional import pad_sequence_to_length
+from verl_utils.tool.function.get_func_from_context import get_impl_and_deps
+
+class vLLMRolloutWithTool(vLLMRollout):
+    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
+        super().__init__(model_path, config, tokenizer, model_hf_config, **kwargs)
+
+        self.tool_config = self.config.get("tool_config_path", "")
+        if self.tool_config:
+            self.tool_config = OmegaConf.load(self.tool_config)
+            self.tool_json_path = self.tool_config["tools"][0]["config"]["tool_json_path"]
+
+        self.tokenizer = tokenizer
+        self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
+
+        self.gen_str = "\n<|im_start|>assistant\n"
+        self.gen_ids = self.tokenizer.encode(self.gen_str)
+    
+    def format_tool_call(self, tool_call_str: str):
+        """Convert JSON function call description to Python executable code string."""
+        try:
+            call_json = json.loads(tool_call_str)
+            func_name = call_json['name']
+            arguments = call_json.get('arguments', {})
+            
+            args_str = ', '.join(f"{k}={repr(v)}" for k, v in arguments.items())
+            return f"{func_name}({args_str})"
+        except Exception as e:
+            return f"Parse tool call failed: {e}"
+
+    def validate_tool_calls(self, output_str):
+        start_tags = re.findall(r'<tool_call>', output_str)
+        end_tags = re.findall(r'</tool_call>', output_str)
+        
+        if len(start_tags) != len(end_tags):
+            return False
+            
+        start_positions = [m.start() for m in re.finditer(r'<tool_call>', output_str)]
+        end_positions = [m.start() for m in re.finditer(r'</tool_call>', output_str)]
+        
+        for start, end in zip(start_positions, end_positions):
+            if start >= end:
+                return False
+                
+        return True
+
+    def extract_tool_calls(self, output_str):
+        if not self.validate_tool_calls(output_str):
+            return []
+
+        try:
+            pattern = r'<tool_call>((?:(?!</tool_call>).)*)</tool_call>'
+            matches = re.finditer(pattern, output_str, re.DOTALL)
+            
+            return [match.group(1).strip() for match in matches]
+        except Exception as e:
+            return []
+    
+    def batch_execute(self, env_list: List[str], tool_calls_list: List[List[str]]):
+        def exe_tool_call(env, call):
+            try:
+                call_dict = json.loads(call)
+                assert call_dict['name'] == 'get_code_of_methods', 'Only support `get_code_of_methods` method currently.'
+                name = call_dict['arguments']['method_name']
+                response, answer_count, error_count = get_impl_and_deps(name, env)
+                return response.strip()
+            except Exception as e:
+                return str(e)
+
+        # flatten all tasks
+        all_tasks = []
+        task_indices = []
+        for env_idx, (env, tool_calls) in enumerate(zip(env_list, tool_calls_list)):
+            for call_idx, tool_call in enumerate(tool_calls):
+                all_tasks.append((env, tool_call))
+                task_indices.append((env_idx, call_idx))
+
+        # parallel execute all tasks
+        all_results = [None] * len(all_tasks)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_index = {executor.submit(exe_tool_call, env, call): i 
+                            for i, (env, call) in enumerate(all_tasks)}
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                all_results[index] = future.result()
+
+        # reorganize results to original structure
+        results_list = [[None for _ in range(len(tool_calls_list[i]))] for i, _ in enumerate(env_list)]
+        for (env_idx, call_idx), result in zip(task_indices, all_results):
+            results_list[env_idx][call_idx] = result
+
+        return results_list
+
+    @torch.no_grad()
+    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:        
+        # rebuild vllm cache engine
+        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+            self.inference_engine.init_cache_engine()
+
+        ori_input_ids = prompts.batch['input_ids']  # (bs, prompt_length)
+        # left-padded attention_mask
+        attention_mask = prompts.batch['attention_mask']
+        position_ids = prompts.batch['position_ids']
+
+        # used to construct attention_mask
+        eos_token_id = prompts.meta_info['eos_token_id']
+
+        batch_size = ori_input_ids.size(0)
+
+        idx_list = []
+        # parse idx from torch.Tensor to List[List[str]]
+        for i in range(batch_size):
+            idx_list.append(_pre_process_inputs(self.pad_token_id, ori_input_ids[i]))
+
+        do_sample = prompts.meta_info.get('do_sample', True)
+        is_validate = prompts.meta_info.get('validate', False)
+        if not do_sample:
+            kwargs = {
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 0,
+                'n': 1  # if greedy, only 1 response
+            }
+        elif is_validate:
+            kwargs = { # use the same kwargs.
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 0,
+                'n': 1  # if greedy, only 1 response
+            }
+
+        with self.update_sampling_params(**kwargs):
+            # prepare n copies for each input
+            curr_inputs = []
+            for input_ids in idx_list:
+                for _ in range(self.sampling_params.n):
+                    curr_inputs.append(input_ids.copy())
+            init_inputs = [ids.copy() for ids in curr_inputs]
+
+            # if there are envs, prepare n copies for each env
+            env_list = []
+            for instance_id in prompts.non_tensor_batch['instance_id']:
+                for _ in range(self.sampling_params.n):
+                    with open(f"{self.tool_json_path}/{instance_id}.json", "r") as f:
+                        tree = json.load(f)
+                    env_list.append(tree)
+
+            # track the status of each input
+            curr_max_tokens = [self.sampling_params.max_tokens] * len(curr_inputs)
+            active_indices = list(range(len(curr_inputs)))
+
+            # collect the result mask of each rollout, 1 for non-result, 0 for tool call result or pad
+            result_mask_list = [[] for _ in range(len(curr_inputs))]
+
+            # generate until all inputs are completed
+            for step in range(self.config.max_turns):
+                if len(active_indices) == 0:
+                    break
+
+                # only process the active inputs
+                active_inputs = [curr_inputs[i] for i in active_indices]
+                active_max_tokens = [curr_max_tokens[i] for i in active_indices]
+                
+                with self.update_sampling_params(
+                    n=1, 
+                    max_tokens=min(2048, max(active_max_tokens)),
+                    stop_token_ids=[151644],
+                    top_p=0.99,
+                ):  # 2048 at most, and add <|im_start|> as stop for corner case
+                    vllm_inputs = [{
+                        'prompt_token_ids': raw_prompt_ids
+                    } for raw_prompt_ids in active_inputs]
+                    outputs = self.inference_engine.generate(
+                        prompts=vllm_inputs,
+                        sampling_params=self.sampling_params,
+                        use_tqdm=False
+                    )
+
+                # collect all tool calls
+                tool_calls_list: List[List[str]] = []
+                call_indices: List[int] = []
+
+                # process each output
+                new_active_indices = []
+                for i, idx in enumerate(active_indices):
+                    output_ids = outputs[i].outputs[0].token_ids
+                    finish_reason = outputs[i].outputs[0].finish_reason
+                    stop_reason = outputs[i].outputs[0].stop_reason
+                    
+                    if finish_reason == 'stop' and (stop_reason == None or stop_reason == self.tokenizer.pad_token_id):
+                        curr_inputs[idx] += output_ids
+                        result_mask_list[idx] += [1] * len(output_ids)
+
+                        output_str = self.tokenizer.decode(output_ids)
+                        tool_calls: List[str] = self.extract_tool_calls(output_str)
+                        if tool_calls:
+                            tool_calls_list.append(tool_calls)
+                            call_indices.append(idx)
+                            new_active_indices.append(idx)
+                        else:
+                            pass # no tool calls
+                    elif finish_reason == 'length':
+                        # output over max tokens
+                        curr_inputs[idx] += output_ids
+                        result_mask_list[idx] += [1] * len(output_ids)
+                    elif finish_reason == 'stop' and stop_reason == 151644: # 151644 is the id of <|im_start|>, is a illigal stop, we stop here
+                        curr_inputs[idx] += output_ids
+                        result_mask_list[idx] += [1] * len(output_ids)
+                    else:
+                        raise ValueError(f"unknown stop reason. finish_reason: {finish_reason}, stop_reason: {stop_reason}")
+
+                # batch process tool calls
+                if tool_calls_list:
+                    # Only tp_rank 0 executes the tools
+                    if self.tp_rank == 0:
+                        active_env_list = [env_list[i] for i in call_indices]
+                        tool_responses_list = self.batch_execute(active_env_list, tool_calls_list)
+                        
+                        # Prepare data for broadcasting
+                        broadcast_data = {
+                            'tool_calls_list': tool_calls_list,
+                            'call_indices': call_indices,
+                            'tool_responses_list': tool_responses_list
+                        }
+                    else:
+                        broadcast_data = None
+                    
+                    broadcast_data = vllm_ps._TP.broadcast_object(broadcast_data, src=0)
+                    
+                    # All ranks process the broadcasted data
+                    if broadcast_data is not None:
+                        tool_calls_list = broadcast_data['tool_calls_list']
+                        call_indices = broadcast_data['call_indices']
+                        tool_responses_list = broadcast_data['tool_responses_list']
+
+                        for idx, tool_calls, tool_responses in zip(call_indices, tool_calls_list, tool_responses_list):
+                            tool_response_str = ''
+                            for call, response in zip(tool_calls, tool_responses):
+                                tool_response_str += f"<tool_response>{call}\n{response}\n</tool_response>\n"
+                            tool_response_str = "\n<|im_start|>user\n" + tool_response_str + "<|im_end|>"
+                            output_ids = self.tokenizer.encode(tool_response_str)
+                            curr_inputs[idx] += output_ids
+                            result_mask_list[idx] += [0] * len(output_ids)
+
+                            curr_inputs[idx] += self.gen_ids
+                            result_mask_list[idx] += [0] * len(self.gen_ids)
+
+                # check if need to truncate, if yes, truncate, and remove from active; if no, update curr_max_tokens
+                length_checked_active_indices = []
+                for idx in active_indices:
+                    assert len(curr_inputs[idx]) - len(init_inputs[idx]) == len(result_mask_list[idx]), f"curr_inputs: {len(curr_inputs[idx])}, init_inputs: {len(init_inputs[idx])}, result_mask_list: {len(result_mask_list[idx])}"
+                    if len(curr_inputs[idx]) - len(init_inputs[idx]) >= self.config.response_length:
+                        curr_inputs[idx] = init_inputs[idx] \
+                            + curr_inputs[idx][len(init_inputs[idx]):len(init_inputs[idx])+self.config.response_length]
+                        result_mask_list[idx] = result_mask_list[idx][:self.config.response_length]
+                    else:
+                        curr_max_tokens[idx] = self.config.response_length - len(curr_inputs[idx]) + len(init_inputs[idx])
+                        if idx in new_active_indices:
+                            length_checked_active_indices.append(idx)
+                active_indices = length_checked_active_indices
+
+            output_ids_list = []
+            # collect the all rollouts
+            for i, input_ids in enumerate(idx_list):
+                for j in range(self.sampling_params.n):
+                    idx = i * self.sampling_params.n + j
+                    input_len = len(input_ids)
+                    output_ids_list.append(curr_inputs[idx][input_len:])
+
+        response_attention_mask_list = []
+        response_list = []
+        result_mask_list_padded = []
+        for output_ids, result_mask in zip(output_ids_list, result_mask_list):
+            assert len(output_ids) == len(result_mask), f"output_ids: {len(output_ids)}, result_mask: {len(result_mask)}"
+            # to tensor 
+            response = torch.tensor(output_ids, device=ori_input_ids.device)
+            result_mask = torch.tensor(result_mask, device=ori_input_ids.device)
+            # response attention mask, 1 for valid, 0 for invalid
+            response_attention_mask = torch.ones_like(response, dtype=torch.int64)
+            response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
+            response_attention_mask_list.append(response_attention_mask)
+            # response, pad to response_length
+            response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+            response_list.append(response)
+            # result mask, 1 for non-result, 0 for result or pad
+            result_mask = pad_sequence_to_length(result_mask, self.config.response_length, 0)
+            result_mask_list_padded.append(result_mask)
+        response_attention_mask = torch.stack(response_attention_mask_list, dim=0)
+        response = torch.stack(response_list, dim=0)
+        result_mask = torch.stack(result_mask_list_padded, dim=0)
+
+        if self.config.n > 1 and do_sample:
+            ori_input_ids = ori_input_ids.repeat_interleave(self.config.n, dim=0)
+            attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
+            position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
+            batch_size = batch_size * self.config.n
+        seq = torch.cat([ori_input_ids, response], dim=-1)
+
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+
+        # TODO(sgm): fix position_ids on right_pad
+        # prompt: left pad + response: right pad
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+        response_position_ids = position_ids[:, -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+                
+        # concat attenion_mask for input and response
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        # result mask: result part is 0, other part is 1
+        loss_mask = result_mask * response_attention_mask
+        
+        # all the tp ranks should contain the same data here. data in all ranks are valid
+        batch = TensorDict({
+            'prompts': ori_input_ids,
+            'responses': response,
+            'input_ids': seq,  # here input_ids become the whole sentences
+            'attention_mask': attention_mask,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids
+        }, batch_size=batch_size)
+
+        # free vllm cache engine
+        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+            self.inference_engine.free_cache_engine()
+
+        return DataProto(batch=batch)
