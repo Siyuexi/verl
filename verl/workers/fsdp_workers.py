@@ -417,7 +417,7 @@ class ActorRolloutRefWorker(Worker, WorkerProfilerExtension):
                 rollout_class = vLLMRolloutWithTool
             else:
                 raise NotImplementedError(f'Rollout name {self.config.rollout.name} is not supported')
-            from verl.workers.sharding_manager import FSDPVLLMShardingManager
+            from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
             log_gpu_memory_usage(f'Before building {rollout_name} rollout', logger=None)
             local_path = copy_to_local(self.config.model.path)
             if vllm_mode == 'customized':
