@@ -298,9 +298,10 @@ class RLHFDataset(Dataset):
         if self.return_full_prompt:
             row_dict["full_prompts"] = raw_prompt  # array of strings
 
-        # add instance_id for each prompt
-        instance_id = row_dict.get("extra_info", {}).get("id", "")
-        row_dict["instance_id"] = instance_id
+        # add instance_id for each prompt if use tools
+        if row_dict.get("extra_info", {}).get("need_tools_kwargs", False):
+            instance_id = row_dict.get("extra_info", {}).get("id", "")
+            row_dict["instance_id"] = instance_id
 
         # add index for each prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
