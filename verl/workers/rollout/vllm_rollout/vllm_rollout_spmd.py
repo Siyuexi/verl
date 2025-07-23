@@ -567,10 +567,10 @@ class vLLMRolloutWithTool(vLLMRollout):
             # if there are envs, prepare n copies for each env
             env_list = []
             for instance_id in prompts.non_tensor_batch['instance_id']:
-                for _ in range(self.sampling_params.n):
-                    with open(f"{self.tool_json_path}/{instance_id}.json", "r") as f:
-                        tree = json.load(f)
-                    env_list.append(tree)
+                with open(f"{self.tool_json_path}/{instance_id}.json", "r") as f:
+                    tree = json.load(f)
+                    for _ in range(self.sampling_params.n):
+                        env_list.append(tree)
 
             # track the status of each input
             curr_max_tokens = [self.sampling_params.max_tokens] * len(curr_inputs)
