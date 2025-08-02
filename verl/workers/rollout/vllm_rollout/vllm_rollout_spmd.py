@@ -33,6 +33,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Union
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.distributed
 from omegaconf import DictConfig, OmegaConf
@@ -92,6 +93,8 @@ class vLLMRollout(BaseRollout):
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+
+        self.vocab_size = tokenizer.vocab_size
 
         if kwargs.get("train_tp") is not None:
             # deployed with megatron
@@ -163,6 +166,7 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
+            max_logprobs=self.vocab_size,
             seed=config.get("seed", 0),
             **lora_kwargs,
             **engine_kwargs,
@@ -280,6 +284,8 @@ class vLLMRollout(BaseRollout):
                 lora_int_id = lora_int_ids[0]
                 lora_requests = [LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")] * batch_size
 
+        kwargs["logprobs"] = self.vocab_size if self.config.response_length == 1 else None
+        
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
@@ -294,10 +300,18 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
+            rollout_log_probs_dict = []
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
                     response.append(response_ids)
+                    if self.config.response_length == 1:
+                        first_step_logprobs = output.outputs[sample_id].logprobs[0]
+                        logprob_float_dict = np.full((self.vocab_size,), -np.inf, dtype=np.float32)
+                        for token_id, logprob in first_step_logprobs.items():
+                            if token_id < self.vocab_size:
+                                logprob_float_dict[token_id] = logprob.logprob
+                        rollout_log_probs_dict.append(logprob_float_dict)
                     if self.config.calculate_log_probs:
                         curr_log_prob = []
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
@@ -349,6 +363,8 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+        if self.config.response_length == 1:
+            non_tensor_batch["generation_logprobs"] = np.stack(rollout_log_probs_dict)
 
         # free vllm cache engine
         if (

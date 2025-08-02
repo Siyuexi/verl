@@ -20,6 +20,7 @@ import os
 import hydra
 import numpy as np
 import ray
+import torch
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -69,11 +70,34 @@ def main_task(config):
         assert config.data.n_samples == 1, "When temperature=0, n_samples must be 1."
     assert config.data.n_samples >= 1, "n_samples should always >= 1"
 
+    bin_flag = False # to adapt to binary classification task.
+    if config.rollout.response_length == 1:
+        bin_flag = True
+
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
     chat_lst = dataset[config.data.prompt_key].tolist()
 
     chat_lst = [chat.tolist() for chat in chat_lst]
+
+    if bin_flag:
+        new_chat_lst = []
+        for chat in chat_lst:
+            if chat[-1]["role"] == "user":
+                new_chat = chat.copy()
+                new_chat.append({"role": "assistant", "content": "<judgement>"})
+                new_chat_lst.append(new_chat)
+            else:
+                new_chat_lst.append(chat)
+        chat_lst = new_chat_lst
+        yes_token_id = tokenizer.encode(" YES", add_special_tokens=False)[0]
+        no_token_id = tokenizer.encode(" NO", add_special_tokens=False)[0]
+        print(f"' YES' token id encoded: {tokenizer.encode(' YES', add_special_tokens=False)}")
+        print(f"'YES' token id encoded: {tokenizer.encode('YES', add_special_tokens=False)}")
+        print(f"' NO' token id encoded: {tokenizer.encode(' NO', add_special_tokens=False)}")
+        print(f"'NO' token id encoded: {tokenizer.encode('NO', add_special_tokens=False)}")
+        # assert tokenizer.encode(" YES", add_special_tokens=False) == tokenizer.encode("YES", add_special_tokens=False), f'Inconsistent encoding for "YES": {tokenizer.encode(" YES", add_special_tokens=False)} vs {tokenizer.encode("YES", add_special_tokens=False)}'
+        # assert tokenizer.encode(' NO', add_special_tokens=False) == tokenizer.encode('NO', add_special_tokens=False), f'Inconsistent encoding for "NO": {tokenizer.encode(" NO", add_special_tokens=False)} vs {tokenizer.encode("NO", add_special_tokens=False)}'
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
@@ -121,12 +145,25 @@ def main_task(config):
             output = unpad_dataproto(output_padded, pad_size=pad_size)
 
             output_texts = []
+            rollout_log_probs = output.non_tensor_batch.get("generation_logprobs", [{} for _ in range(len(output))])
             for i in range(len(output)):
                 data_item = output[i]
-                prompt_length = data_item.batch["prompts"].shape[-1]
-                valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
-                valid_response_ids = data_item.batch["responses"][:valid_response_length]
-                response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+                if bin_flag:
+                    logit_dict = rollout_log_probs[i]
+                    print(logit_dict)
+                    yes_logit = logit_dict[yes_token_id]
+                    no_logit = logit_dict[no_token_id]
+                    if yes_logit == -float('inf') and no_logit == -float('inf'):
+                        response_str = "<judgement>UNK</judgement>"
+                    elif yes_logit >= no_logit:
+                        response_str = "<judgement>YES</judgement>"
+                    elif yes_logit < no_logit:
+                        response_str = "<judgement>NO</judgement>"
+                else:
+                    prompt_length = data_item.batch["prompts"].shape[-1]
+                    valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+                    valid_response_ids = data_item.batch["responses"][:valid_response_length]
+                    response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
                 output_texts.append(response_str)
 
             output_lst[n_sample].extend(output_texts)
