@@ -284,7 +284,7 @@ class vLLMRollout(BaseRollout):
                 lora_int_id = lora_int_ids[0]
                 lora_requests = [LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")] * batch_size
 
-        kwargs["logprobs"] = self.vocab_size if self.config.response_length == 1 else None
+        kwargs["logprobs"] = self.vocab_size if self.config.response_length == 1 else 1
         
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -362,9 +362,9 @@ class vLLMRollout(BaseRollout):
         )
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
-            batch["rollout_log_probs"] = rollout_log_probs
+            batch["trajs_logprobs"] = rollout_log_probs
         if self.config.response_length == 1:
-            non_tensor_batch["generation_logprobs"] = np.stack(rollout_log_probs_dict)
+            non_tensor_batch["first_logprobs"] = np.stack(rollout_log_probs_dict)
 
         # free vllm cache engine
         if (

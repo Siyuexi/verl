@@ -73,6 +73,9 @@ def main_task(config):
     bin_flag = False # to adapt to binary classification task.
     if config.rollout.response_length == 1:
         bin_flag = True
+    traj_flag = False
+    if config.rollout.calculate_log_probs:
+        traj_flag = True
 
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
@@ -116,6 +119,7 @@ def main_task(config):
     config_batch_size = config.data.batch_size
     num_batch = -(-total_samples // config_batch_size)
     output_lst = [[] for _ in range(config.data.n_samples)]
+    entropy_lst = [[] for _ in range(config.data.n_samples)]
 
     for batch_idx in range(num_batch):
         print(f"[{batch_idx + 1}/{num_batch}] Start to process.")
@@ -145,11 +149,15 @@ def main_task(config):
             output = unpad_dataproto(output_padded, pad_size=pad_size)
 
             output_texts = []
-            rollout_log_probs = output.non_tensor_batch.get("generation_logprobs", [{} for _ in range(len(output))])
+            batch_entropies = []
+            trajs_logprobs = output.batch.get("trajs_logprobs", None)
+            first_logprobs = output.non_tensor_batch.get("first_logprobs", None)
             for i in range(len(output)):
                 data_item = output[i]
+                if traj_flag:
+                    logprobs = trajs_logprobs[i]
                 if bin_flag:
-                    logit_dict = rollout_log_probs[i]
+                    logit_dict = first_logprobs[i]
                     print(logit_dict)
                     yes_logit = logit_dict[yes_token_id]
                     no_logit = logit_dict[no_token_id]
@@ -164,16 +172,33 @@ def main_task(config):
                     valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
                     valid_response_ids = data_item.batch["responses"][:valid_response_length]
                     response_str = tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+                    if traj_flag:
+                        actual_logprobs = logprobs[:valid_response_length]
+                        if valid_response_length > 0:
+                            entropy_sum = 0.0
+                            for token_logprob in actual_logprobs:
+                                prob = np.exp(token_logprob)
+                                entropy_sum += -prob * token_logprob
+                            avg_entropy = entropy_sum / valid_response_length
+                        else:
+                            avg_entropy = 0.0
+                        batch_entropies.append(avg_entropy)
                 output_texts.append(response_str)
 
             output_lst[n_sample].extend(output_texts)
+            entropy_lst[n_sample].extend(batch_entropies)
 
     # convert output_lst from (n_samples, n_data) to (n_data, n_sampels)
     output_lst = np.array(output_lst, dtype=object)
     output_lst = np.transpose(output_lst, axes=(1, 0)).tolist()
 
+    entropy_lst = np.array(entropy_lst, dtype=float)
+    entropy_lst = np.transpose(entropy_lst, axes=(1, 0)).tolist()
+
     # add to the data frame
     dataset["responses"] = output_lst
+
+    dataset["entropy"] = entropy_lst
 
     # write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)
