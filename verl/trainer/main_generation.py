@@ -198,7 +198,8 @@ def main_task(config):
     # add to the data frame
     dataset["responses"] = output_lst
 
-    dataset["entropy"] = entropy_lst
+    if traj_flag:
+        dataset["entropy"] = entropy_lst
 
     # write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)
