@@ -435,19 +435,17 @@ class vLLMAsyncRollout:
 
 import re
 import json
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from verl.utils.torch_functional import pad_sequence_to_length
-from verl_utils.tool.function.get_func_from_context import get_impl_and_deps
+from verl_utils.tool.search_tool import SearchTool
+from verl_utils.tool.edit_tool import EditTool
 
 class vLLMRolloutWithTool(vLLMRollout):
     def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
         super().__init__(model_path, config, tokenizer, model_hf_config, **kwargs)
 
-        self.tool_config = self.config.get("tool_config_path", "")
-        if self.tool_config:
-            self.tool_config = OmegaConf.load(self.tool_config)
-            self.tool_json_path = self.tool_config["tools"][0]["config"]["tool_json_path"]
+        self.tool_root_path = self.config.get("tool_root_path", "")
+        self.enable_write = self.config.get("enable_write", False)
 
         self.tokenizer = tokenizer
         self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
@@ -495,38 +493,53 @@ class vLLMRolloutWithTool(vLLMRollout):
         except Exception as e:
             return []
     
-    def batch_execute(self, env_list: List[str], tool_calls_list: List[List[str]]):
-        def exe_tool_call(env, call):
+    def batch_execute(self, tool_list: List[str], tool_calls_list: List[List[str]]):
+        def exe_tool_call(tool, call):
             try:
-                call_dict = json.loads(call)
-                assert call_dict['name'] == 'get_code_of_methods', 'Only support `get_code_of_methods` method currently.'
-                name = call_dict['arguments']['method_name']
-                response, answer_count, error_count = get_impl_and_deps(name, env)
+                tool_call = json.loads(call)
+            except Exception as e:
+                return f"Tool call parse failed, exception message: {str(e)}"
+            try:
+                function_name = tool_call.get('name', None)
+                function_args = tool_call.get('arguments', None)
+                if function_name == 'task_done':
+                    response = tool['workspace'].get_diff()
+                    tool['workspace'].del_ws()
+                elif function_name == 'edit_tool': 
+                    path = function_args.get("path", None)
+                    start_line = function_args.get("start_line", None)
+                    end_line = function_args.get("end_line", None)
+                    new_str = function_args.get("new_str", None)
+                    response = tool['edit_tool'].execute(path, start_line, end_line, new_str)
+                elif function_name == 'search_tool': 
+                    construct = function_args.get("construct", None)
+                    entity = function_args.get("entity", None)
+                    response = tool['search_tool'].execute(construct, entity)
                 return response.strip()
             except Exception as e:
-                return str(e)
+                return f"Tool call execute failed, exception message: {str(e)}"
 
         # flatten all tasks
         all_tasks = []
         task_indices = []
-        for env_idx, (env, tool_calls) in enumerate(zip(env_list, tool_calls_list)):
+        for tool_idx, (tool, tool_calls) in enumerate(zip(tool_list, tool_calls_list)):
             for call_idx, tool_call in enumerate(tool_calls):
-                all_tasks.append((env, tool_call))
-                task_indices.append((env_idx, call_idx))
+                all_tasks.append((tool, tool_call))
+                task_indices.append((tool_idx, call_idx))
 
         # parallel execute all tasks
         all_results = [None] * len(all_tasks)
         with ThreadPoolExecutor(max_workers=8) as executor:
-            future_to_index = {executor.submit(exe_tool_call, env, call): i 
-                            for i, (env, call) in enumerate(all_tasks)}
+            future_to_index = {executor.submit(exe_tool_call, tool, call): i 
+                            for i, (tool, call) in enumerate(all_tasks)}
             for future in as_completed(future_to_index):
                 index = future_to_index[future]
                 all_results[index] = future.result()
 
         # reorganize results to original structure
-        results_list = [[None for _ in range(len(tool_calls_list[i]))] for i, _ in enumerate(env_list)]
-        for (env_idx, call_idx), result in zip(task_indices, all_results):
-            results_list[env_idx][call_idx] = result
+        results_list = [[None for _ in range(len(tool_calls_list[i]))] for i, _ in enumerate(tool_list)]
+        for (tool_idx, call_idx), result in zip(task_indices, all_results):
+            results_list[tool_idx][call_idx] = result
 
         return results_list
 
@@ -580,13 +593,30 @@ class vLLMRolloutWithTool(vLLMRollout):
                     curr_inputs.append(input_ids.copy())
             init_inputs = [ids.copy() for ids in curr_inputs]
 
-            # if there are envs, prepare n copies for each env
-            env_list = []
-            for instance_id in prompts.non_tensor_batch['instance_id']:
-                with open(f"{self.tool_json_path}/{instance_id}.json", "r") as f:
-                    tree = json.load(f)
-                    for _ in range(self.sampling_params.n):
-                        env_list.append(tree)
+            # if there are tools, prepare n copies for each tool
+            tool_list = []
+            print(f"####### Length of tools_kwargs: {len(prompts.non_tensor_batch['tools_kwargs'])}")
+            print(f"####### N sampling_params: {self.sampling_params.n}")
+            for tools_kwargs in prompts.non_tensor_batch['tools_kwargs']:
+                for _ in range(self.sampling_params.n):
+                    if self.enable_write:
+                        edit_tool = EditTool(self.tool_root_path, tools_kwargs['instance_id'])
+                        search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
+                        workspace = edit_tool.workspace.create_ws(tools_kwargs['base_commit'])
+                        tool_list.append(
+                            {
+                                'edit_tool': edit_tool,
+                                'search_tool': search_tool,
+                                'workspace': workspace,
+                            }
+                        )
+                    else:
+                        search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
+                        tool_list.append(
+                            {
+                                'search_tool': search_tool,
+                            }
+                        )
 
             # track the status of each input
             curr_max_tokens = [self.sampling_params.max_tokens] * len(curr_inputs)
@@ -657,8 +687,8 @@ class vLLMRolloutWithTool(vLLMRollout):
                 if tool_calls_list:
                     # Only tp_rank 0 executes the tools
                     if self.tp_rank == 0:
-                        active_env_list = [env_list[i] for i in call_indices]
-                        tool_responses_list = self.batch_execute(active_env_list, tool_calls_list)
+                        active_tool_list = [tool_list[i] for i in call_indices]
+                        tool_responses_list = self.batch_execute(active_tool_list, tool_calls_list)
                         
                         # Prepare data for broadcasting
                         broadcast_data = {
@@ -770,5 +800,9 @@ class vLLMRolloutWithTool(vLLMRollout):
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
+
+        if self.enable_write:
+            for tool in tool_list:
+                tool['workspace'].del_ws()
 
         return DataProto(batch=batch)
