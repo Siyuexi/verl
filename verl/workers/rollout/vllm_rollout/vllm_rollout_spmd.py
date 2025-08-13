@@ -636,11 +636,11 @@ class vLLMRolloutWithTool(vLLMRollout):
                 
                 with self.update_sampling_params(
                     n=1, 
-                    max_tokens=min(2048, max(active_max_tokens)),
+                    max_tokens=min(self.config.max_single_turn_tokens, max(active_max_tokens)),
                     # max_tokens=max(active_max_tokens),
                     stop_token_ids=[151644],
                     top_p=0.99,
-                ):  # 2048 at most, and add <|im_start|> as stop for corner case
+                ):  # self.config.max_single_turn_tokens at most, and add <|im_start|> as stop for corner case
                     vllm_inputs = [{
                         'prompt_token_ids': raw_prompt_ids
                     } for raw_prompt_ids in active_inputs]
