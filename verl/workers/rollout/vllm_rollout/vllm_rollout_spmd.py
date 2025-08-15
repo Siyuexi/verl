@@ -439,6 +439,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from verl.utils.torch_functional import pad_sequence_to_length
 from verl_utils.tool.search_tool import SearchTool
 from verl_utils.tool.edit_tool import EditTool
+import concurrent.futures
 
 class vLLMRolloutWithTool(vLLMRollout):
     def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
@@ -502,9 +503,8 @@ class vLLMRolloutWithTool(vLLMRollout):
             try:
                 function_name = tool_call.get('name', None)
                 function_args = tool_call.get('arguments', None)
-                if function_name == 'task_done':
+                if function_name == 'patch_submission':
                     response = tool['workspace'].get_diff()
-                    tool['workspace'].del_ws()
                 elif function_name == 'edit_tool': 
                     path = function_args.get("path", None)
                     start_line = function_args.get("start_line", None)
@@ -602,12 +602,12 @@ class vLLMRolloutWithTool(vLLMRollout):
                     if self.enable_write:
                         edit_tool = EditTool(self.tool_root_path, tools_kwargs['instance_id'])
                         search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
-                        workspace = edit_tool.workspace.create_ws(tools_kwargs['base_commit'])
                         tool_list.append(
                             {
                                 'edit_tool': edit_tool,
                                 'search_tool': search_tool,
-                                'workspace': workspace,
+                                'workspace': edit_tool.workspace,
+                                'base_commit': tools_kwargs['base_commit']
                             }
                         )
                     else:
@@ -617,6 +617,28 @@ class vLLMRolloutWithTool(vLLMRollout):
                                 'search_tool': search_tool,
                             }
                         )
+            print(f"####### Length of tool_list: {len(tool_list)}")
+            if self.enable_write:
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    tasks = []
+                    for tool_dict in tool_list:
+                        tasks.append((
+                            tool_dict['workspace'],
+                            tool_dict['base_commit']
+                        ))
+                    futures = {
+                        executor.submit(ws.create_ws, bc): (idx, ws, bc)
+                        for idx, (ws, bc) in enumerate(tasks)
+                    }
+                    
+                    for future in concurrent.futures.as_completed(futures):
+                        idx, ws, bc = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            print(f"Error creating workspace for {ws.path}, base_commit: {bc}: {str(e)}")
+                            exit()
+            print(f"####### All workspace created.")
 
             # track the status of each input
             curr_max_tokens = [self.sampling_params.max_tokens] * len(curr_inputs)
@@ -711,7 +733,9 @@ class vLLMRolloutWithTool(vLLMRollout):
                             tool_response_str = ''
                             for call, response in zip(tool_calls, tool_responses):
                                 tool_response_str += f"<tool_response>{call}\n{response}\n</tool_response>\n"
-                            tool_response_str = "\n<|im_start|>user\n" + tool_response_str + "<|im_end|>"
+                            tool_response_str = "\n<|im_start|>user\n" + tool_response_str + "<|im_end|>" # original
+                            # tool_response_str = "\n<|im_start|>function\n" + tool_response_str + "<|im_end|>" # for qwen3 agent workflow
+                            # tool_response_str = "\n<|im_start|>tool\n" + tool_response_str + "<|im_end|>" # for qwen3 vllm workflow
                             output_ids = self.tokenizer.encode(tool_response_str)
                             curr_inputs[idx] += output_ids
                             result_mask_list[idx] += [0] * len(output_ids)
@@ -804,5 +828,7 @@ class vLLMRolloutWithTool(vLLMRollout):
         if self.enable_write:
             for tool in tool_list:
                 tool['workspace'].del_ws()
+
+        print("####### Rollout done.")
 
         return DataProto(batch=batch)
