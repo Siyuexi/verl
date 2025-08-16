@@ -114,7 +114,7 @@ class RLHFDataset(Dataset):
         self.chat_template_func = config.get("chat_template_func", None)
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
         self.filter_prompts = config.get("filter_prompts", True)
-        self.enable_qwen3_thinking = config.get("qwen3_thinking", True)
+        self.enable_qwen3_thinking = config.get("enable_qwen3_thinking", True)
         self.serialize_dataset = False
         self._download()
         self._read_files_and_tokenize()
