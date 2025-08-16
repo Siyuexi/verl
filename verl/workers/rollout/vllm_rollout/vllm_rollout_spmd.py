@@ -446,6 +446,7 @@ class vLLMRolloutWithTool(vLLMRollout):
         super().__init__(model_path, config, tokenizer, model_hf_config, **kwargs)
 
         self.tool_root_path = self.config.get("tool_root_path", "")
+        self.tool_temp_path = self.config.get("tool_temp_path", "")
         self.enable_write = self.config.get("enable_write", False)
 
         self.tokenizer = tokenizer
@@ -600,7 +601,7 @@ class vLLMRolloutWithTool(vLLMRollout):
             for tools_kwargs in prompts.non_tensor_batch['tools_kwargs']:
                 for _ in range(self.sampling_params.n):
                     if self.enable_write:
-                        edit_tool = EditTool(self.tool_root_path, tools_kwargs['instance_id'])
+                        edit_tool = EditTool(self.tool_root_path, self.tool_temp_path, tools_kwargs['instance_id'])
                         search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
                         tool_list.append(
                             {
@@ -732,10 +733,8 @@ class vLLMRolloutWithTool(vLLMRollout):
                         for idx, tool_calls, tool_responses in zip(call_indices, tool_calls_list, tool_responses_list):
                             tool_response_str = ''
                             for call, response in zip(tool_calls, tool_responses):
-                                tool_response_str += f"<tool_response>{call}\n{response}\n</tool_response>\n"
-                            tool_response_str = "\n<|im_start|>user\n" + tool_response_str + "<|im_end|>" # original
-                            # tool_response_str = "\n<|im_start|>function\n" + tool_response_str + "<|im_end|>" # for qwen3 agent workflow
-                            # tool_response_str = "\n<|im_start|>tool\n" + tool_response_str + "<|im_end|>" # for qwen3 vllm workflow
+                                tool_response_str += f"<tool_response>{call}\n{response}\n[WARNING]: You have to finish this task within {self.config.max_turns} turns. This is {step+1} turn. Only {self.config.max_turns-step-1} left!\n\n</tool_response>\n"
+                            tool_response_str = "\n<|im_start|>user\n" + tool_response_str + "<|im_end|>"
                             output_ids = self.tokenizer.encode(tool_response_str)
                             curr_inputs[idx] += output_ids
                             result_mask_list[idx] += [0] * len(output_ids)
