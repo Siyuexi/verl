@@ -114,7 +114,7 @@ class RLHFDataset(Dataset):
         self.chat_template_func = config.get("chat_template_func", None)
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
         self.filter_prompts = config.get("filter_prompts", True)
-        self.enable_qwen3_thinking = config.get("enable_qwen3_thinking", None)
+        self.enable_qwen3_thinking = config.get("enable_qwen3_thinking", True)
         self.serialize_dataset = False
         self._download()
         self._read_files_and_tokenize()
@@ -251,10 +251,12 @@ class RLHFDataset(Dataset):
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
 
+        real_max_prompt_length = self.max_prompt_length if self.enable_qwen3_thinking else (self.max_prompt_length + 6) # non-thinking template will add 6 tokens: <think>\n\n</think>\n\n
+
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_length=self.max_prompt_length if self.enable_qwen3_thinking else (self.max_prompt_length + 6), # non-thinking template will add 6 tokens: <think>\n\n</think>\n\n
+            max_length=real_max_prompt_length,
             pad_token_id=self.tokenizer.pad_token_id,
             left_pad=True,
             truncation=self.truncation,
@@ -282,17 +284,17 @@ class RLHFDataset(Dataset):
         row_dict["position_ids"] = position_ids[0]
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.max_prompt_length:
+        if len(raw_prompt_ids) > real_max_prompt_length:
             if self.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.max_prompt_length :]
+                raw_prompt_ids = raw_prompt_ids[-real_max_prompt_length :]
             elif self.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.max_prompt_length]
+                raw_prompt_ids = raw_prompt_ids[: real_max_prompt_length]
             elif self.truncation == "middle":
-                left_half = self.max_prompt_length // 2
-                right_half = self.max_prompt_length - left_half
+                left_half = real_max_prompt_length // 2
+                right_half = real_max_prompt_length - left_half
                 raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
             elif self.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
+                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {real_max_prompt_length}.")
 
         row_dict["raw_prompt_ids"] = raw_prompt_ids
         # encode prompts without chat template
