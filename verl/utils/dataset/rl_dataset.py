@@ -114,7 +114,7 @@ class RLHFDataset(Dataset):
         self.chat_template_func = config.get("chat_template_func", None)
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
         self.filter_prompts = config.get("filter_prompts", True)
-        self.enable_qwen3_thinking = config.get("enable_qwen3_thinking", True)
+        self.enable_qwen3_thinking = config.get("enable_qwen3_thinking", None)
         self.serialize_dataset = False
         self._download()
         self._read_files_and_tokenize()
@@ -254,7 +254,7 @@ class RLHFDataset(Dataset):
         input_ids, attention_mask = verl_F.postprocess_data(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_length=self.max_prompt_length,
+            max_length=self.max_prompt_length if self.enable_qwen3_thinking else (self.max_prompt_length + 6), # non-thinking template will add 6 tokens: <think>\n\n</think>\n\n
             pad_token_id=self.tokenizer.pad_token_id,
             left_pad=True,
             truncation=self.truncation,

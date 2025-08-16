@@ -448,11 +448,15 @@ class vLLMRolloutWithTool(vLLMRollout):
         self.tool_root_path = self.config.get("tool_root_path", "")
         self.tool_temp_path = self.config.get("tool_temp_path", "")
         self.enable_write = self.config.get("enable_write", False)
+        self.enable_qwen3_thinking_in_multiturn = self.config.get("enable_qwen3_thinking_in_multiturn", True)
 
         self.tokenizer = tokenizer
         self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
 
-        self.gen_str = "\n<|im_start|>assistant\n"
+        if self.enable_qwen3_thinking_in_multiturn:
+            self.gen_str = "\n<|im_start|>assistant\n"
+        else:
+            self.gen_str = "\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         self.gen_ids = self.tokenizer.encode(self.gen_str)
     
     def format_tool_call(self, tool_call_str: str):
