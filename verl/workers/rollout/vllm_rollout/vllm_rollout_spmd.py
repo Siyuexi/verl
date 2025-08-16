@@ -742,9 +742,9 @@ class vLLMRolloutWithTool(vLLMRollout):
                             output_ids = self.tokenizer.encode(tool_response_str)
                             curr_inputs[idx] += output_ids
                             result_mask_list[idx] += [0] * len(output_ids)
-
-                            curr_inputs[idx] += self.gen_ids
-                            result_mask_list[idx] += [0] * len(self.gen_ids)
+                            if step != self.config.max_turns - 1: # add next turn's completion ids if it is not the last turn.
+                                curr_inputs[idx] += self.gen_ids
+                                result_mask_list[idx] += [0] * len(self.gen_ids)
 
                 # check if need to truncate, if yes, truncate, and remove from active; if no, update curr_max_tokens
                 length_checked_active_indices = []
