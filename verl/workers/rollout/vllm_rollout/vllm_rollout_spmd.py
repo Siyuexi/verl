@@ -598,52 +598,54 @@ class vLLMRolloutWithTool(vLLMRollout):
                     curr_inputs.append(input_ids.copy())
             init_inputs = [ids.copy() for ids in curr_inputs]
 
-            # if there are tools, prepare n copies for each tool
-            tool_list = []
-            print(f"####### Length of tools_kwargs: {len(prompts.non_tensor_batch['tools_kwargs'])}")
-            print(f"####### N sampling_params: {self.sampling_params.n}")
-            for tools_kwargs in prompts.non_tensor_batch['tools_kwargs']:
-                for _ in range(self.sampling_params.n):
-                    if self.enable_write:
-                        edit_tool = EditTool(self.tool_root_path, self.tool_temp_path, tools_kwargs['instance_id'])
-                        search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
-                        tool_list.append(
-                            {
-                                'edit_tool': edit_tool,
-                                'search_tool': search_tool,
-                                'workspace': edit_tool.workspace,
-                                'base_commit': tools_kwargs['base_commit']
-                            }
-                        )
-                    else:
-                        search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
-                        tool_list.append(
-                            {
-                                'search_tool': search_tool,
-                            }
-                        )
-            print(f"####### Length of tool_list: {len(tool_list)}")
-            if self.enable_write:
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    tasks = []
-                    for tool_dict in tool_list:
-                        tasks.append((
-                            tool_dict['workspace'],
-                            tool_dict['base_commit']
-                        ))
-                    futures = {
-                        executor.submit(ws.create_ws, bc): (idx, ws, bc)
-                        for idx, (ws, bc) in enumerate(tasks)
-                    }
-                    
-                    for future in concurrent.futures.as_completed(futures):
-                        idx, ws, bc = futures[future]
-                        try:
-                            future.result()
-                        except Exception as e:
-                            print(f"Error creating workspace for {ws.path}, base_commit: {bc}: {str(e)}")
-                            exit()
-            print(f"####### All workspace created.")
+            # only init tools for self.tp_rank
+            if self.tp_rank == 0:
+                # if there are tools, prepare n copies for each tool
+                tool_list = []
+                print(f"####### Length of tools_kwargs: {len(prompts.non_tensor_batch['tools_kwargs'])}")
+                print(f"####### N sampling_params: {self.sampling_params.n}")
+                for tools_kwargs in prompts.non_tensor_batch['tools_kwargs']:
+                    for _ in range(self.sampling_params.n):
+                        if self.enable_write:
+                            edit_tool = EditTool(self.tool_root_path, self.tool_temp_path, tools_kwargs['instance_id'])
+                            search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
+                            tool_list.append(
+                                {
+                                    'edit_tool': edit_tool,
+                                    'search_tool': search_tool,
+                                    'workspace': edit_tool.workspace,
+                                    'base_commit': tools_kwargs['base_commit']
+                                }
+                            )
+                        else:
+                            search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
+                            tool_list.append(
+                                {
+                                    'search_tool': search_tool,
+                                }
+                            )
+                print(f"####### Length of tool_list: {len(tool_list)}")
+                if self.enable_write:
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        tasks = []
+                        for tool_dict in tool_list:
+                            tasks.append((
+                                tool_dict['workspace'],
+                                tool_dict['base_commit']
+                            ))
+                        futures = {
+                            executor.submit(ws.create_ws, bc): (idx, ws, bc)
+                            for idx, (ws, bc) in enumerate(tasks)
+                        }
+                        
+                        for future in concurrent.futures.as_completed(futures):
+                            idx, ws, bc = futures[future]
+                            try:
+                                future.result()
+                            except Exception as e:
+                                print(f"Error creating workspace for {ws.path}, base_commit: {bc}: {str(e)}")
+                                exit()
+                print(f"####### All workspace created.")
 
             # track the status of each input
             curr_max_tokens = [self.sampling_params.max_tokens] * len(curr_inputs)
@@ -748,14 +750,15 @@ class vLLMRolloutWithTool(vLLMRollout):
 
                 # check if need to truncate, if yes, truncate, and remove from active; if no, update curr_max_tokens
                 length_checked_active_indices = []
+                real_response_length = self.config.response_length if self.enable_qwen3_thinking_in_multiturn else (self.config.response_length - 6)
                 for idx in active_indices:
                     assert len(curr_inputs[idx]) - len(init_inputs[idx]) == len(result_mask_list[idx]), f"curr_inputs: {len(curr_inputs[idx])}, init_inputs: {len(init_inputs[idx])}, result_mask_list: {len(result_mask_list[idx])}"
-                    if len(curr_inputs[idx]) - len(init_inputs[idx]) >= self.config.response_length:
+                    if len(curr_inputs[idx]) - len(init_inputs[idx]) >= real_response_length:
                         curr_inputs[idx] = init_inputs[idx] \
-                            + curr_inputs[idx][len(init_inputs[idx]):len(init_inputs[idx])+self.config.response_length]
-                        result_mask_list[idx] = result_mask_list[idx][:self.config.response_length]
+                            + curr_inputs[idx][len(init_inputs[idx]):len(init_inputs[idx])+real_response_length]
+                        result_mask_list[idx] = result_mask_list[idx][:real_response_length]
                     else:
-                        curr_max_tokens[idx] = self.config.response_length - len(curr_inputs[idx]) + len(init_inputs[idx])
+                        curr_max_tokens[idx] = real_response_length - len(curr_inputs[idx]) + len(init_inputs[idx])
                         if idx in new_active_indices:
                             length_checked_active_indices.append(idx)
                 active_indices = length_checked_active_indices
@@ -778,13 +781,13 @@ class vLLMRolloutWithTool(vLLMRollout):
             result_mask = torch.tensor(result_mask, device=ori_input_ids.device)
             # response attention mask, 1 for valid, 0 for invalid
             response_attention_mask = torch.ones_like(response, dtype=torch.int64)
-            response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
+            response_attention_mask = pad_sequence_to_length(response_attention_mask, real_response_length, 0)
             response_attention_mask_list.append(response_attention_mask)
             # response, pad to response_length
-            response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+            response = pad_sequence_to_length(response, real_response_length, self.pad_token_id)
             response_list.append(response)
             # result mask, 1 for non-result, 0 for result or pad
-            result_mask = pad_sequence_to_length(result_mask, self.config.response_length, 0)
+            result_mask = pad_sequence_to_length(result_mask, real_response_length, 0)
             result_mask_list_padded.append(result_mask)
         response_attention_mask = torch.stack(response_attention_mask_list, dim=0)
         response = torch.stack(response_list, dim=0)
@@ -829,9 +832,10 @@ class vLLMRolloutWithTool(vLLMRollout):
             self.inference_engine.free_cache_engine()
 
         if self.enable_write:
-            for tool in tool_list:
-                tool['workspace'].del_ws()
+            if self.tp_rank == 0:
+                for tool in tool_list:
+                    tool['workspace'].del_ws()
 
-        print("####### Rollout done.")
+            print("####### Rollout done.")
 
         return DataProto(batch=batch)
