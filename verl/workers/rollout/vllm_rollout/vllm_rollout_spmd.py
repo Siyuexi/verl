@@ -607,6 +607,8 @@ class vLLMRolloutWithTool(vLLMRollout):
                 for tools_kwargs in prompts.non_tensor_batch['tools_kwargs']:
                     for _ in range(self.sampling_params.n):
                         if self.enable_write:
+                            if not os.path.exists(self.tool_temp_path):
+                                os.makedirs(self.tool_temp_path, exist_ok=True)
                             edit_tool = EditTool(self.tool_root_path, self.tool_temp_path, tools_kwargs['instance_id'])
                             search_tool = SearchTool(self.tool_root_path, tools_kwargs['instance_id'])
                             tool_list.append(

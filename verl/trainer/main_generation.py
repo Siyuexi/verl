@@ -76,6 +76,8 @@ def main_task(config):
     traj_flag = False
     if config.rollout.calculate_log_probs:
         traj_flag = True
+    if not config.data.get('data.enable_qwen3_thinking', 'True'):
+        think_flag = False
 
     # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
     dataset = pd.read_parquet(config.data.path)
@@ -101,6 +103,27 @@ def main_task(config):
         print(f"'NO' token id encoded: {tokenizer.encode('NO', add_special_tokens=False)}")
         # assert tokenizer.encode(" YES", add_special_tokens=False) == tokenizer.encode("YES", add_special_tokens=False), f'Inconsistent encoding for "YES": {tokenizer.encode(" YES", add_special_tokens=False)} vs {tokenizer.encode("YES", add_special_tokens=False)}'
         # assert tokenizer.encode(' NO', add_special_tokens=False) == tokenizer.encode('NO', add_special_tokens=False), f'Inconsistent encoding for "NO": {tokenizer.encode(" NO", add_special_tokens=False)} vs {tokenizer.encode("NO", add_special_tokens=False)}'
+    if not think_flag:
+        new_chat_lst = []
+        for chat in chat_lst:
+            if chat[-1]["role"] == "user":
+                new_chat = chat.copy()
+                new_chat.append({"role": "assistant", "content": "<think>\n\n</think>\n\n"})
+                new_chat_lst.append(new_chat)
+            else:
+                new_chat_lst.append(chat)
+        chat_lst = new_chat_lst
+        print(f"Example of last chat: {chat_lst[0]}")
+        print(f"""Example of ids: {str(tokenizer.apply_chat_template(
+            chat_lst[0],
+            add_generation_prompt=True,
+            padding=True,
+            truncation=True,
+            max_length=config.rollout.prompt_length,
+            return_tensors="pt",
+            return_dict=True,
+            tokenize=True,
+        ))}""")
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
