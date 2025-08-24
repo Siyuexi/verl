@@ -598,6 +598,11 @@ class vLLMRolloutWithTool(vLLMRollout):
                     curr_inputs.append(input_ids.copy())
             init_inputs = [ids.copy() for ids in curr_inputs]
 
+            # Initialize a tracker for "bad" trajectories (out of max_turn or max_token)
+            # True if a trajectory is terminated due to max_length or max_turns.
+            num_sequences = len(curr_inputs)
+            is_bad_trajectory = [False] * num_sequences
+
             # only init tools for self.tp_rank
             if self.tp_rank == 0:
                 # if there are tools, prepare n copies for each tool
@@ -756,6 +761,8 @@ class vLLMRolloutWithTool(vLLMRollout):
                 for idx in active_indices:
                     assert len(curr_inputs[idx]) - len(init_inputs[idx]) == len(result_mask_list[idx]), f"curr_inputs: {len(curr_inputs[idx])}, init_inputs: {len(init_inputs[idx])}, result_mask_list: {len(result_mask_list[idx])}"
                     if len(curr_inputs[idx]) - len(init_inputs[idx]) >= real_response_length:
+                        # If trajectory is truncated due to length, mark it as bad.
+                        is_bad_trajectory[idx] = True
                         curr_inputs[idx] = init_inputs[idx] \
                             + curr_inputs[idx][len(init_inputs[idx]):len(init_inputs[idx])+real_response_length]
                         result_mask_list[idx] = result_mask_list[idx][:real_response_length]
@@ -764,6 +771,11 @@ class vLLMRolloutWithTool(vLLMRollout):
                         if idx in new_active_indices:
                             length_checked_active_indices.append(idx)
                 active_indices = length_checked_active_indices
+
+            # Any sequence still active after the loop has hit the max_turns limit.
+            # Mark them as bad trajectories.
+            for idx in active_indices:
+                is_bad_trajectory[idx] = True
 
             output_ids_list = []
             # collect the all rollouts
@@ -819,7 +831,11 @@ class vLLMRolloutWithTool(vLLMRollout):
         # result mask: result part is 0, other part is 1
         loss_mask = result_mask * response_attention_mask
         
-        # all the tp ranks should contain the same data here. data in all ranks are valid
+        # Apply the final mask. Zero out the loss_mask for all bad trajectories.
+        for i in range(num_sequences):
+            if is_bad_trajectory[i]:
+                loss_mask[i] = 0 # This will broadcast 0 across the whole sequence length dimension.
+
         batch = TensorDict({
             'prompts': ori_input_ids,
             'responses': response,
