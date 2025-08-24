@@ -713,6 +713,9 @@ class vLLMRolloutWithTool(vLLMRollout):
                         # output over max tokens
                         curr_inputs[idx] += output_ids
                         result_mask_list[idx] += [1] * len(output_ids)
+                        is_bad_trajectory[idx] = True
+                        # If a single turn is truncated, the whole trajectory is considered bad.
+                        # This sequence will not have tool calls, so it will naturally terminate.
                     elif finish_reason == 'stop' and stop_reason == 151644: # 151644 is the id of <|im_start|>, is a illigal stop, we stop here
                         curr_inputs[idx] += output_ids
                         result_mask_list[idx] += [1] * len(output_ids)
