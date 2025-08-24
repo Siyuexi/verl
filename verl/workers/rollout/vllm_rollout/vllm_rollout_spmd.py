@@ -448,6 +448,7 @@ class vLLMRolloutWithTool(vLLMRollout):
         self.tool_root_path = self.config.get("tool_root_path", "")
         self.tool_temp_path = self.config.get("tool_temp_path", "")
         self.enable_write = self.config.get("enable_write", False)
+        self.enable_compact_filtering = self.config.get("enable_compact_filtering", False)
         self.enable_qwen3_thinking_in_multiturn = self.config.get("enable_qwen3_thinking_in_multiturn", True)
 
         self.tokenizer = tokenizer
@@ -835,9 +836,10 @@ class vLLMRolloutWithTool(vLLMRollout):
         loss_mask = result_mask * response_attention_mask
         
         # Apply the final mask. Zero out the loss_mask for all bad trajectories.
-        for i in range(num_sequences):
-            if is_bad_trajectory[i]:
-                loss_mask[i] = 0 # This will broadcast 0 across the whole sequence length dimension.
+        if self.enable_compact_filtering:
+            for i in range(num_sequences):
+                if is_bad_trajectory[i]:
+                    loss_mask[i] = 0 # This will broadcast 0 across the whole sequence length dimension.
 
         batch = TensorDict({
             'prompts': ori_input_ids,
